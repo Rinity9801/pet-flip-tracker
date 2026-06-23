@@ -1,0 +1,30 @@
+name: Pet flip scan
+
+# Scans the Hypixel auction house and writes pet-flip results to Cloudflare KV,
+# which pets.adong.dev serves. Runs on GitHub's IPs (no Coflnet ban, no rate limit).
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes (GitHub may delay under load)
+  workflow_dispatch: {}        # allow manual runs from the Actions tab
+
+concurrency:
+  group: pet-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        run: npm ci || npm install
+      - name: Scan Hypixel AH and write to Cloudflare KV
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+        run: node scan.mjs
