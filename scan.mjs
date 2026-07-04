@@ -56,6 +56,48 @@ async function fetchAllAuctions() {
   return all;
 }
 
+/******** Pet XP thresholds (NEU constants) ********/
+// The XP needed to *reach* the cap level, not to match the sell listing's stored exp:
+// pets keep accumulating exp past max level, so the cheapest cap-level listing is often
+// over-ground by tens of millions — using its exp inflates "XP to grind" and understates
+// coins/XP. Thresholds are exact game data from NotEnoughUpdates' public constants.
+const NEU_PETS = 'https://raw.githubusercontent.com/NotEnoughUpdates/NotEnoughUpdates-REPO/master/constants/pets.json';
+let XP = null; // { offsets: {TIER: idx}, levels: [xp per level-up], custom: {TYPE: {type, pet_levels}} }
+
+async function loadXpTable() {
+  try {
+    const d = await getJson(NEU_PETS);
+    if (!d.pet_rarity_offset || !Array.isArray(d.pet_levels)) throw new Error('unexpected shape');
+    XP = { offsets: d.pet_rarity_offset, levels: d.pet_levels, custom: d.custom_pet_leveling || {} };
+    // Sanity-check against known values; a bad table is worse than the fallback.
+    const gd200 = expToReach('GOLDEN_DRAGON', 'LEGENDARY', 200);
+    const leg100 = expToReach('WOLF', 'LEGENDARY', 100);
+    if (gd200 !== 210255385 || leg100 !== 25353230) {
+      console.warn(`XP table failed sanity check (gd200=${gd200}, leg100=${leg100}) — falling back to sell-listing exp`);
+      XP = null;
+    }
+  } catch (e) {
+    console.warn(`XP table fetch failed (${e.message}) — falling back to sell-listing exp`);
+  }
+}
+
+// Total XP needed to reach `level` from level 1 for this pet type + tier, or null if unknown.
+function expToReach(type, tier, level) {
+  if (!XP) return null;
+  const off = XP.offsets[tier];
+  if (off == null) return null;
+  let total = 0;
+  const base = Math.min(level, 100);
+  for (let l = 1; l < base; l++) total += XP.levels[off + l - 1];
+  if (level > 100) {
+    const custom = XP.custom[type];
+    // type 1 = extra per-level costs appended after level 100 (the 200-cap dragons)
+    if (custom?.type !== 1 || !Array.isArray(custom.pet_levels)) return null;
+    for (let i = 0; i < level - 100; i++) total += custom.pet_levels[i] ?? 0;
+  }
+  return total;
+}
+
 /******** Read level/rarity/exp from a pet auction's NBT ********/
 async function readPet(auction) {
   const m = /\[Lvl (\d+)\]/.exec(auction.item_name || '');
@@ -84,7 +126,7 @@ async function readPet(auction) {
 
 /******** Per-pet flip analysis (sell pinned to the cap level) ********/
 // Compute the flip for a single rarity tier, or null if it has no usable buy/sell pair.
-function flipForTier(tier, list, cap) {
+function flipForTier(type, tier, list, cap) {
   const byLevel = {};
   for (const p of list) if (!byLevel[p.level] || p.price < byLevel[p.level].price) byLevel[p.level] = p;
   const sell = byLevel[cap];
@@ -93,9 +135,12 @@ function flipForTier(tier, list, cap) {
   const buyLevels = Object.keys(byLevel).map(Number).filter((L) => L < cap).sort((a, b) => a - b);
   if (buyLevels.length === 0) return null;
 
+  // Grind target: just crossing the cap threshold (exact table), not matching the
+  // possibly over-ground exp stored on the sell listing.
+  const capExp = expToReach(type, tier, cap);
   const rows = buyLevels.map((L) => {
     const a = byLevel[L];
-    const xp = sell.exp - a.exp;
+    const xp = (capExp != null ? capExp : sell.exp) - a.exp;
     const profit = sellNet - a.price;
     return { level: L, price: a.price, uuid: a.uuid, exp: a.exp, xp, profit, perXp: xp > 0 ? profit / xp : null };
   });
@@ -114,7 +159,7 @@ function analyse(type, name, pets) {
 
   const rarities = {};
   for (const tier of Object.keys(byTier)) {
-    const flip = flipForTier(tier, byTier[tier], cap);
+    const flip = flipForTier(type, tier, byTier[tier], cap);
     if (flip) rarities[tier] = flip;
   }
 
@@ -182,6 +227,7 @@ async function putKV(key, value) {
 
 /******** Main ********/
 async function main() {
+  await loadXpTable();
   const auctions = await fetchAllAuctions();
   const bins = auctions.filter((a) => a.bin && /\[Lvl \d+\]/.test(a.item_name || ''));
   console.log(`pet BINs: ${bins.length}`);
