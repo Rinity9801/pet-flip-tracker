@@ -69,10 +69,12 @@ async function loadXpTable() {
     const d = await getJson(NEU_PETS);
     if (!d.pet_rarity_offset || !Array.isArray(d.pet_levels)) throw new Error('unexpected shape');
     XP = { offsets: d.pet_rarity_offset, levels: d.pet_levels, custom: d.custom_pet_leveling || {} };
-    // Sanity-check against known values; a bad table is worse than the fallback.
+    // Sanity-check against known values; a bad table is worse than the fallback. The Lvl 200
+    // dragon total moved from 210,255,385 when NEU updated the Lvl 100/101 dragon XP on
+    // 2026-08-09 (NEU-REPO #2989); the old value made every scan fall back from then on.
     const gd200 = expToReach('GOLDEN_DRAGON', 'LEGENDARY', 200);
     const leg100 = expToReach('WOLF', 'LEGENDARY', 100);
-    if (gd200 !== 210255385 || leg100 !== 25353230) {
+    if (gd200 !== 214023230 || leg100 !== 25353230) {
       console.warn(`XP table failed sanity check (gd200=${gd200}, leg100=${leg100}) — falling back to sell-listing exp`);
       XP = null;
     }
@@ -97,6 +99,84 @@ function expToReach(type, tier, level) {
   }
   return total;
 }
+
+/******** Material prices (Hypixel bazaar, public) + Kat upgrade costs (Coflnet, public) ********/
+const BAZAAR = 'https://api.hypixel.net/v2/skyblock/bazaar';
+const KAT_DATA = 'https://sky.coflnet.com/api/kat/data';
+const TIERS = ['COMMON', 'UNCOMMON', 'RARE', 'EPIC', 'LEGENDARY', 'MYTHIC'];
+let BZ = null;           // productId -> instant-buy price
+const AH_PRICE = {};     // tag -> Coflnet median (null = unknown), for the few non-bazaar mats
+let KAT = null;          // 'TYPE|FROM_TIER' -> { from, to, coins, hours, materials: {id: amount} }
+
+async function loadBazaar() {
+  try {
+    const d = await getJson(BAZAAR);
+    BZ = {};
+    for (const [id, p] of Object.entries(d.products || {})) {
+      const buy = p.quick_status?.buyPrice;
+      if (buy > 0) BZ[id] = buy;
+    }
+    console.log(`bazaar: ${Object.keys(BZ).length} priced products`);
+  } catch (e) {
+    console.warn(`bazaar fetch failed (${e.message}) — Kat upgrades and the Golden Dragon craft are skipped`);
+    BZ = null;
+  }
+}
+
+async function loadKatData() {
+  try {
+    const rows = await getJson(KAT_DATA);
+    KAT = {};
+    for (const r of rows) {
+      const type = (r.itemTag || '').replace(/^PET_/, '');
+      const i = TIERS.indexOf(r.baseRarity);
+      if (!type || i < 0 || i + 1 >= TIERS.length) continue;
+      KAT[type + '|' + r.baseRarity] = { from: r.baseRarity, to: TIERS[i + 1], coins: r.cost || 0, hours: r.hours || 0, materials: r.materials || {} };
+    }
+    console.log(`kat: ${Object.keys(KAT).length} upgrade steps`);
+  } catch (e) {
+    console.warn(`kat data fetch failed (${e.message}) — Kat upgrades skipped`);
+    KAT = null;
+  }
+}
+
+// Unit price of a material: bazaar instant-buy, else Coflnet's AH median, else null.
+async function materialPrice(id) {
+  if (BZ && BZ[id]) return BZ[id];
+  if (!(id in AH_PRICE)) {
+    try {
+      const r = await fetch(`https://sky.coflnet.com/api/item/price/${id}`, { headers: { 'user-agent': 'pet-flip-scanner (adong.dev)' } });
+      const d = r.ok ? await r.json() : null;
+      AH_PRICE[id] = d && d.median > 0 ? d.median : null;
+    } catch (e) {
+      AH_PRICE[id] = null;
+    }
+  }
+  return AH_PRICE[id];
+}
+
+// Coins + priced materials. Materials nobody prices (cheap vanilla blocks) count as 0 but are
+// listed in `unpriced`, so the site can say so instead of hiding them.
+async function costOf(coins, materials) {
+  const mats = [];
+  const unpriced = [];
+  let matCost = 0;
+  for (const [id, amount] of Object.entries(materials)) {
+    const unit = await materialPrice(id);
+    if (unit == null) { unpriced.push(id); continue; }
+    mats.push({ id, amount, unit });
+    matCost += unit * amount;
+  }
+  return { coins, materials: mats, unpriced, matCost, total: coins + matCost };
+}
+
+// A Golden Dragon at Lvl 1 is made, not only bought: 500M coins plus these materials.
+const GDRAG_CRAFT = {
+  coins: 500e6,
+  materials: { ENCHANTED_GOLD_BLOCK: 50, PERFECT_AMETHYST_GEM: 1, PERFECT_JADE_GEM: 1,
+    PERFECT_SAPPHIRE_GEM: 1, PERFECT_AMBER_GEM: 1, PERFECT_TOPAZ_GEM: 1 },
+};
+let GDRAG_CRAFT_COST = null; // costOf(...) result once the bazaar has loaded
 
 /******** Read level/rarity/exp from a pet auction's NBT ********/
 async function readPet(auction) {
@@ -125,42 +205,84 @@ async function readPet(auction) {
 }
 
 /******** Per-pet flip analysis (sell pinned to the cap level) ********/
-// Compute the flip for a single rarity tier, or null if it has no usable buy/sell pair.
-function flipForTier(type, tier, list, cap) {
-  const byLevel = {};
-  for (const p of list) if (!byLevel[p.level] || p.price < byLevel[p.level].price) byLevel[p.level] = p;
-  const sell = byLevel[cap];
+// One flip: buy at some level of `buyList`, optionally pay `extra` (a Kat upgrade), grind to
+// `cap` at `sellTier`, sell the cheapest cap-level listing of `sellList`. `crafted` adds a
+// synthetic buy row (the Golden Dragon made at Lvl 1). Null when there's no buy/sell pair.
+function buildFlip({ type, key, label, sellTier, buyList, sellList, cap, extra = null, crafted = null }) {
+  const cheapest = (list) => {
+    const by = {};
+    for (const p of list) if (!by[p.level] || p.price < by[p.level].price) by[p.level] = p;
+    return by;
+  };
+  const sell = cheapest(sellList)[cap];
   if (!sell) return null;
   const sellNet = netSell(sell.price);
-  const buyLevels = Object.keys(byLevel).map(Number).filter((L) => L < cap).sort((a, b) => a - b);
-  if (buyLevels.length === 0) return null;
+  const byLevel = cheapest(buyList);
+  const extraCost = extra ? extra.total : 0;
 
-  // Grind target: just crossing the cap threshold (exact table), not matching the
-  // possibly over-ground exp stored on the sell listing.
-  const capExp = expToReach(type, tier, cap);
-  const rows = buyLevels.map((L) => {
-    const a = byLevel[L];
+  // Grind target: just crossing the cap threshold (exact table) at the rarity it's sold at,
+  // not matching the possibly over-ground exp stored on the sell listing. A Kat upgrade
+  // keeps the pet's exp, so the XP still to grind is measured against the new rarity.
+  const capExp = expToReach(type, sellTier, cap);
+  const row = (L, a, isCrafted) => {
     const xp = (capExp != null ? capExp : sell.exp) - a.exp;
-    const profit = sellNet - a.price;
-    return { level: L, price: a.price, uuid: a.uuid, exp: a.exp, xp, profit, perXp: xp > 0 ? profit / xp : null };
-  });
+    const profit = sellNet - a.price - extraCost;
+    const r = { level: L, price: a.price, uuid: a.uuid || null, exp: a.exp, xp, profit, perXp: xp > 0 ? profit / xp : null };
+    if (isCrafted) r.crafted = true;
+    return r;
+  };
+  const rows = Object.keys(byLevel).map(Number).filter((L) => L < cap).sort((a, b) => a - b)
+    .map((L) => row(L, byLevel[L], false));
+  if (crafted) rows.unshift(row(1, { price: crafted.total, exp: 0 }, true));
+  if (rows.length === 0) return null;
+
   let bb = null;
   for (const r of rows) if (r.perXp !== null && (bb === null || r.perXp > bb.perXp)) bb = r;
   if (!bb) return null;
-  return { tier, sell: { level: cap, price: sell.price, uuid: sell.uuid }, sellNet, best: bb, levels: rows, perXp: bb.perXp };
+  const flip = { tier: key, sell: { level: cap, price: sell.price, uuid: sell.uuid }, sellNet, best: bb, levels: rows, perXp: bb.perXp };
+  if (label) flip.label = label;
+  if (extra) flip.upgrade = extra;
+  if (crafted) flip.craft = crafted;
+  return flip;
 }
 
-// Returns a pet with a flip for EVERY rarity that has one, plus a default = best coins/XP.
-// Top-level fields mirror the default rarity (so ranking/sorting use the best one).
-function analyse(type, name, pets) {
+// Returns a pet with a flip for EVERY option that has one, plus a default = best coins/XP.
+// Options are keyed in `rarities`: a plain tier ("EPIC"), a Kat upgrade ("EPIC>LEGENDARY":
+// buy epic, upgrade, sell legendary) or the Golden Dragon sold at Lvl 100 ("LEGENDARY@100").
+// Top-level fields mirror the default option (so ranking/sorting use the best one).
+async function analyse(type, name, pets) {
   const cap = maxLevel(type);
   const byTier = {};
   for (const p of pets) (byTier[p.tier] = byTier[p.tier] || []).push(p);
+  const isGdrag = type === 'GOLDEN_DRAGON';
+  const craft = isGdrag ? GDRAG_CRAFT_COST : null;
 
   const rarities = {};
   for (const tier of Object.keys(byTier)) {
-    const flip = flipForTier(type, tier, byTier[tier], cap);
+    const flip = buildFlip({ type, key: tier, sellTier: tier, buyList: byTier[tier], sellList: byTier[tier], cap,
+      crafted: isGdrag && tier === 'LEGENDARY' ? craft : null });
     if (flip) rarities[tier] = flip;
+  }
+
+  // Golden Dragons are often only taken to Lvl 100 (the egg stage), from a made Lvl 1.
+  if (isGdrag && byTier.LEGENDARY) {
+    const flip = buildFlip({ type, key: 'LEGENDARY@100', label: 'legendary · lvl 100', sellTier: 'LEGENDARY',
+      buyList: byTier.LEGENDARY, sellList: byTier.LEGENDARY, cap: 100, crafted: craft });
+    if (flip) rarities['LEGENDARY@100'] = flip;
+  }
+
+  // Kat upgrades: buy at one rarity, upgrade to the next, grind and sell at the higher one.
+  if (KAT && BZ) {
+    for (const from of Object.keys(byTier)) {
+      const step = KAT[type + '|' + from];
+      if (!step || !byTier[step.to]) continue;
+      const cost = await costOf(step.coins, step.materials);
+      const extra = { from, to: step.to, hours: step.hours, ...cost };
+      const key = from + '>' + step.to;
+      const flip = buildFlip({ type, key, label: from.toLowerCase() + ' → ' + step.to.toLowerCase() + ' (Kat)',
+        sellTier: step.to, buyList: byTier[from], sellList: byTier[step.to], cap, extra });
+      if (flip) rarities[key] = flip;
+    }
   }
 
   const tiers = Object.keys(rarities);
@@ -228,6 +350,11 @@ async function putKV(key, value) {
 /******** Main ********/
 async function main() {
   await loadXpTable();
+  await Promise.all([loadBazaar(), loadKatData()]);
+  if (BZ) {
+    GDRAG_CRAFT_COST = await costOf(GDRAG_CRAFT.coins, GDRAG_CRAFT.materials);
+    console.log(`golden dragon Lvl 1 craft: ${(GDRAG_CRAFT_COST.total / 1e6).toFixed(1)}M`);
+  }
   const auctions = await fetchAllAuctions();
   const bins = auctions.filter((a) => a.bin && /\[Lvl \d+\]/.test(a.item_name || ''));
   console.log(`pet BINs: ${bins.length}`);
@@ -245,8 +372,9 @@ async function main() {
   }
   await Promise.all(Array.from({ length: CONC }, worker));
 
-  const pets = Object.entries(byType)
-    .map(([type, list]) => analyse(type, prettyName(type), list))
+  const analysed = [];
+  for (const [type, list] of Object.entries(byType)) analysed.push(await analyse(type, prettyName(type), list));
+  const pets = analysed
     .filter((p) => p.perXp !== null)
     .sort((a, b) => b.perXp - a.perXp);
 
@@ -256,12 +384,16 @@ async function main() {
   for (const p of pets) {
     const sold = await fetchSoldCounts(p.tag, cutoff);
     if (sold) {
-      for (const tier of Object.keys(p.rarities)) {
-        const fl = p.rarities[tier];
-        const c = sold.counts[tier] || {};
-        for (const row of fl.levels) row.soldWeek = c[row.level] || 0;
-        fl.sell.soldWeek = c[fl.sell.level] || 0;
-        fl.best.soldWeek = c[fl.best.level] || 0;
+      for (const key of Object.keys(p.rarities)) {
+        const fl = p.rarities[key];
+        // Composite keys: "EPIC>LEGENDARY" buys epic and sells legendary; "LEGENDARY@100" is one tier.
+        const buyTier = key.split(/[>@]/)[0];
+        const sellTier = fl.upgrade ? fl.upgrade.to : buyTier;
+        const cb = sold.counts[buyTier] || {};
+        const cs = sold.counts[sellTier] || {};
+        for (const row of fl.levels) row.soldWeek = row.crafted ? null : (cb[row.level] || 0);
+        fl.sell.soldWeek = cs[fl.sell.level] || 0;
+        fl.best.soldWeek = fl.best.crafted ? null : (cb[fl.best.level] || 0);
       }
       p.soldWindowCapped = sold.capped;
     }
