@@ -170,6 +170,30 @@ async function costOf(coins, materials) {
   return { coins, materials: mats, unpriced, matCost, total: coins + matCost };
 }
 
+// Skipping Kat's wait: a Kat Flower skips 1 day, a Kat Bouquet 5 (both AH items). Each upgrade
+// step is rushed on its own (days don't carry over), with the cheapest flower/bouquet mix.
+async function rushCost(steps) {
+  const flower = await materialPrice('KAT_FLOWER');
+  const bouquet = await materialPrice('KAT_BOUQUET');
+  if (flower == null && bouquet == null) return null;
+  let flowers = 0, bouquets = 0, cost = 0, days = 0;
+  for (const step of steps) {
+    const d = Math.ceil((step.hours || 0) / 24);
+    if (d <= 0) continue;
+    days += d;
+    let best = null;
+    for (let b = 0; b <= Math.ceil(d / 5); b++) {
+      const f = Math.max(0, d - 5 * b);
+      if ((b > 0 && bouquet == null) || (f > 0 && flower == null)) continue;
+      const c = b * (bouquet || 0) + f * (flower || 0);
+      if (best === null || c < best.c) best = { b, f, c };
+    }
+    if (!best) return null;
+    bouquets += best.b; flowers += best.f; cost += best.c;
+  }
+  return { days, flowers, bouquets, flowerPrice: flower, bouquetPrice: bouquet, cost };
+}
+
 // A Golden Dragon at Lvl 1 is made, not only bought: 500M coins plus these materials.
 const GDRAG_CRAFT = {
   coins: 500e6,
@@ -271,17 +295,28 @@ async function analyse(type, name, pets) {
     if (flip) rarities['LEGENDARY@100'] = flip;
   }
 
-  // Kat upgrades: buy at one rarity, upgrade to the next, grind and sell at the higher one.
+  // Kat upgrades: buy at one rarity, upgrade one or more times, grind and sell at the higher
+  // rarity. Every rarity up the chain that has listings to sell into is its own option, so a
+  // pet listed only at common and legendary still gets common → legendary (Kat ×4).
   if (KAT && BZ) {
     for (const from of Object.keys(byTier)) {
-      const step = KAT[type + '|' + from];
-      if (!step || !byTier[step.to]) continue;
-      const cost = await costOf(step.coins, step.materials);
-      const extra = { from, to: step.to, hours: step.hours, ...cost };
-      const key = from + '>' + step.to;
-      const flip = buildFlip({ type, key, label: from.toLowerCase() + ' → ' + step.to.toLowerCase() + ' (Kat)',
-        sellTier: step.to, buyList: byTier[from], sellList: byTier[step.to], cap, extra });
-      if (flip) rarities[key] = flip;
+      const steps = [];
+      let tier = from;
+      for (let step = KAT[type + '|' + tier]; step; step = KAT[type + '|' + tier]) {
+        steps.push(step);
+        tier = step.to;
+        if (!byTier[tier]) continue; // nothing to sell into at this rarity: keep climbing
+        const coins = steps.reduce((t, s) => t + s.coins, 0);
+        const hours = steps.reduce((t, s) => t + s.hours, 0);
+        const materials = {};
+        for (const s of steps) for (const [id, n] of Object.entries(s.materials)) materials[id] = (materials[id] || 0) + n;
+        const cost = await costOf(coins, materials);
+        const extra = { from, to: tier, steps: steps.length, hours, ...cost, rush: await rushCost(steps) };
+        const key = from + '>' + tier;
+        const label = from.toLowerCase() + ' → ' + tier.toLowerCase() + ' (Kat' + (steps.length > 1 ? ' ×' + steps.length : '') + ')';
+        const flip = buildFlip({ type, key, label, sellTier: tier, buyList: byTier[from], sellList: byTier[tier], cap, extra });
+        if (flip) rarities[key] = flip;
+      }
     }
   }
 
